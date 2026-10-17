@@ -16,8 +16,7 @@ import zlib
 
 MAGIC = b'APK Sig Block 42'
 V2_ID = 0x7109871a
-ALG_RSA_PKCS1_SHA256 = 0x0101
-DIGEST_SHA256 = 1
+ALG_RSA_PKCS1_SHA256 = 0x0103   # RSASSA-PKCS1-v1_5 with SHA-256 (0x0101 是 RSA-PSS)
 CHUNK = 1 << 20
 
 
@@ -217,14 +216,18 @@ def build_sf(manifest_bytes, entries):
 
 
 # ------------------------------------------------------------------ v2 block
-def chunked_sha256(*sections):
-    md = hashlib.sha256()
+def content_digest(*sections):
+    """apksig 1MB 分块两层摘要:
+    chunk_digest = SHA256(0xa5 + uint32LE(len) + chunk);
+    final = SHA256(0x5a + uint32LE(chunk_count) + concat(chunk_digests))"""
+    chunk_digests = []
     for sec in sections:
         for i in range(0, len(sec), CHUNK):
             chunk = sec[i:i + CHUNK]
-            md.update(struct.pack('<I', len(chunk)))
-            md.update(chunk)
-    return md.digest()
+            chunk_digests.append(hashlib.sha256(
+                b'\xa5' + struct.pack('<I', len(chunk)) + chunk).digest())
+    blob = b'\x5a' + struct.pack('<I', len(chunk_digests)) + b''.join(chunk_digests)
+    return hashlib.sha256(blob).digest()
 
 
 def lenpref(b):
@@ -233,28 +236,28 @@ def lenpref(b):
 
 def build_v2_block(entries_bytes, cd_bytes, eocd_template, block_offset, priv, cert, spki):
     dummy = b'\x00' * 32
-    digests_d = struct.pack('<I', DIGEST_SHA256) + lenpref(dummy)
+    digests_d = lenpref(struct.pack('<I', ALG_RSA_PKCS1_SHA256) + lenpref(dummy))
     certs_d = lenpref(cert)
     sd_d = lenpref(digests_d) + lenpref(certs_d) + lenpref(b'')
     sig_d = rsa_sign(priv, OID_SHA256, hashlib.sha256(sd_d).digest())
-    signatures_d = struct.pack('<I', ALG_RSA_PKCS1_SHA256) + lenpref(sig_d)
+    signatures_d = lenpref(struct.pack('<I', ALG_RSA_PKCS1_SHA256) + lenpref(sig_d))
     signer_d = lenpref(sd_d) + lenpref(signatures_d) + lenpref(spki)
-    value_d = lenpref(signer_d)
-    pair_d = struct.pack('<II', V2_ID, len(value_d)) + value_d
+    value_d = lenpref(lenpref(signer_d))
+    pair_d = struct.pack('<QI', 4 + len(value_d), V2_ID) + value_d
     block_size = 8 + 16 + len(pair_d)
-    block_end = block_offset + 8 + block_size
     eocd = bytearray(eocd_template)
-    struct.pack_into('<I', eocd, 16, block_end)
-    content_digest = chunked_sha256(entries_bytes, cd_bytes, bytes(eocd))
-    digests = struct.pack('<I', DIGEST_SHA256) + lenpref(content_digest)
+    # 规范: 摘要中 EOCD 的 cd-offset 字段 = 签名块起始偏移(apksig V2SchemeVerifier#verify)
+    struct.pack_into('<I', eocd, 16, block_offset)
+    content_digest_ = content_digest(entries_bytes, cd_bytes, bytes(eocd))
+    digests = lenpref(struct.pack('<I', ALG_RSA_PKCS1_SHA256) + lenpref(content_digest_))
     signed_data = lenpref(digests) + lenpref(certs_d) + lenpref(b'')
     sig = rsa_sign(priv, OID_SHA256, hashlib.sha256(signed_data).digest())
-    signatures = struct.pack('<I', ALG_RSA_PKCS1_SHA256) + lenpref(sig)
+    signatures = lenpref(struct.pack('<I', ALG_RSA_PKCS1_SHA256) + lenpref(sig))
     signer = lenpref(signed_data) + lenpref(signatures) + lenpref(spki)
-    value = lenpref(signer)
-    pair = struct.pack('<II', V2_ID, len(value)) + value
+    value = lenpref(lenpref(signer))
+    pair = struct.pack('<QI', 4 + len(value), V2_ID) + value
     block = struct.pack('<Q', block_size) + pair + struct.pack('<Q', block_size) + MAGIC
-    assert len(block) == block_size + 8
+    assert len(pair) == len(pair_d) and len(block) == block_size + 8
     return block
 
 
